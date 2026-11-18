@@ -5,7 +5,7 @@ Automating Duolingo is against its terms of service; use a spare account at your
 
 ## Windows / Mac / Linux
     pip install -r requirements.txt
-    python main.py
+    python main1.py
 
 ## Termux (Android)
     bash setup_termux.sh

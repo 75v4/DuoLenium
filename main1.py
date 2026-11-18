@@ -3,6 +3,7 @@
 Env vars (or a .env file): DUO_EMAIL, DUO_PASSWORD, DUO_LANG,
 DUO_BROWSER=chrome|firefox, DUO_HEADLESS=1, CHROMEDRIVER, CHROME_BIN, GECKODRIVER
 """
+import json
 import os
 import random
 import re
@@ -121,14 +122,66 @@ def text_of(el):
         return ""
 
 
-def safe_translate(src, tgt, text):
-    if not text.strip():
-        return ""
+CACHE_FILE = "translations.json"
+_blocked_until = 0.0
+_last_call = 0.0
+
+
+def _load_cache():
+    try:
+        return {tuple(k.split("\x1f", 2)): v for k, v in json.load(open(CACHE_FILE, encoding="utf-8")).items()}
+    except Exception:
+        return {}
+
+
+def _save_cache():
+    try:
+        with open(CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump({"\x1f".join(k): v for k, v in _cache.items() if v}, f, ensure_ascii=False)
+    except Exception:
+        pass
+
+
+_cache = _load_cache()
+
+
+def _live_translate(src, tgt, text):
     try:
         return GoogleTranslator(source=src, target=tgt).translate(text) or ""
     except Exception as e:
-        print("Translate failed:", type(e).__name__)
+        if "TooManyRequests" not in type(e).__name__:
+            raise
+    # Google is limiting us: try MyMemory once (needs a real source language)
+    from deep_translator import MyMemoryTranslator
+    s_lang = lang_name if src == "auto" else src
+    t_lang = "english" if tgt == "en" else lang_name
+    return MyMemoryTranslator(source=s_lang, target=t_lang).translate(text) or ""
+
+
+def safe_translate(src, tgt, text):
+    global _blocked_until, _last_call
+    text = text.strip()
+    if not text:
         return ""
+    key = (src, tgt, text)
+    if key in _cache:
+        return _cache[key]
+    if time.time() < _blocked_until:
+        return ""  # cooling down: caller falls back to guessing
+    wait_s = 2.0 - (time.time() - _last_call)
+    if wait_s > 0:
+        time.sleep(wait_s)
+    _last_call = time.time()
+    try:
+        out = _live_translate(src, tgt, text)
+    except Exception as e:
+        print("Translate blocked (%s): pausing translation for 10 min" % type(e).__name__)
+        _blocked_until = time.time() + 600
+        return ""
+    if out:
+        _cache[key] = out
+        _save_cache()
+    return out
 
 
 def to_lang(text):
@@ -136,6 +189,8 @@ def to_lang(text):
 
 
 def to_english(text):
+    if text.strip().isascii():
+        return text.strip()
     return safe_translate("auto", "en", text)
 
 
@@ -232,19 +287,26 @@ def start_practice():
 
 # ---------- answering ----------
 
+def clean_prompt(txt):
+    if lang_code in ("ja", "ko"):
+        txt = re.sub(r"[A-Za-z]", "", txt)
+    return txt.strip()
+
+
 def prompt_text():
     sep = "" if lang_code in ("ja", "ko") else " "
     for sel in (data_test("hint-token"), data_test("challenge-translate-prompt")):
-        txt = sep.join(text_of(e) for e in qs(sel) if text_of(e)).strip()
+        txt = clean_prompt(sep.join(text_of(e) for e in qs(sel) if text_of(e)))
         if txt:
             return txt
-    # fallback: text next to the header
+    # fallback: text next to the header, ignoring labels
     try:
         hdr = q(data_test("challenge-header"))
-        txt = driver.execute_script(
+        raw = driver.execute_script(
             "var p=arguments[0].parentElement.parentElement;return p?p.innerText:'';", hdr)
-        txt = txt.replace(hdr.text, "").strip().split("\n")[0]
-        return txt[:80]
+        skip = {"new word", "new", "previous mistake", hdr.text.strip().lower()}
+        lines = [l.strip() for l in raw.split("\n") if l.strip() and l.strip().lower() not in skip]
+        return clean_prompt(lines[0])[:80] if lines else ""
     except Exception:
         return ""
 
@@ -319,16 +381,20 @@ def solve_pairs():
 
 def solve_choice(header, prompt):
     choices = usable(qs(CHOICE))
+    texts = [text_of(c).lower() for c in choices]
     m = re.search(r'[“"](.+?)[”"]', header)
     target = (m.group(1) if m else to_english(prompt)).lower().strip()
     pick = None
     if target:
-        for c in choices:
-            txt = text_of(c).lower()
+        trs = [""] * len(texts)
+        if any(t for t in texts):
+            joined = to_english("\n".join(t or "-" for t in texts)).lower().split("\n")
+            if len(joined) == len(texts):
+                trs = [j.strip() for j in joined]
+        for c, txt, tr in zip(choices, texts, trs):
             if not txt:
                 continue
-            tr = to_english(txt).lower()
-            if target == txt or target == tr or (len(target) > 2 and (target in tr or tr in target)):
+            if target == txt or target == tr or (len(target) > 2 and tr and (target in tr or tr in target)):
                 pick = c
                 break
     js_click(pick or random.choice(choices))
@@ -348,6 +414,8 @@ def solve(header, prompt):
     elif usable(qs(CHOICE)):
         solve_choice(header, prompt)
     else:
+        names = sorted({e.get_attribute("data-test") for e in qs("[data-test]") if e.get_attribute("data-test")})
+        print("  data-test names:", ", ".join(names))
         raise RuntimeError("unknown question layout")
     advance()
 
