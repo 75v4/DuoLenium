@@ -1,10 +1,11 @@
-"""DuoLenium (updated): Selenium 4 + deep-translator, no bundled drivers.
+"""DuoLenium (updated): Selenium 4 + deep-translator.
 
-Selenium Manager (built into Selenium 4.6+) downloads the matching
-chromedriver automatically, so chromedriver.exe is no longer needed.
+Env vars (or a .env file): DUO_EMAIL, DUO_PASSWORD, DUO_LANG,
+DUO_BROWSER=chrome|firefox, DUO_HEADLESS=1, CHROMEDRIVER, CHROME_BIN, GECKODRIVER
 """
 import os
 import random
+import re
 import shutil
 import sys
 import time
@@ -12,7 +13,11 @@ from getpass import getpass
 
 from deep_translator import GoogleTranslator
 from selenium import webdriver
-from selenium.common.exceptions import NoSuchElementException, TimeoutException
+from selenium.common.exceptions import (
+    NoSuchElementException,
+    StaleElementReferenceException,
+    TimeoutException,
+)
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
@@ -23,11 +28,28 @@ LANG_CODES = {
     "japanese": "ja", "korean": "ko", "turkish": "tr", "polish": "pl",
 }
 
+TOKEN = '[data-test="challenge-tap-token"]'
+CHOICE = '[data-test="challenge-choice"], [data-test="challenge-judge-text"]'
+INPUT = ('[data-test="challenge-translate-input"], [data-test="challenge-text-input"], '
+         '[data-test="challenge-name-input"]')
+
+
+def _load_env(path=".env"):
+    try:
+        for line in open(path, encoding="utf-8"):
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, v = line.split("=", 1)
+                os.environ.setdefault(k.strip(), v.strip())
+    except FileNotFoundError:
+        pass
+
+
+_load_env()
 INTERACTIVE = sys.stdin.isatty()
 
 
 def make_driver():
-    """DUO_BROWSER=chrome|firefox, DUO_HEADLESS=1, CHROMEDRIVER / CHROME_BIN optional."""
     browser = os.environ.get("DUO_BROWSER", "chrome").lower()
     headless = os.environ.get("DUO_HEADLESS", "0") == "1"
     if browser == "firefox":
@@ -36,6 +58,12 @@ def make_driver():
         opts = Options()
         if headless:
             opts.add_argument("-headless")
+        opts.add_argument("--width=1280")
+        opts.add_argument("--height=900")
+        # mute all audio (Duolingo's listening exercises)
+        opts.set_preference("media.volume_scale", "0.0")
+        opts.set_preference("media.autoplay.default", 5)
+        opts.set_preference("media.autoplay.blocking_policy", 2)
         gecko = os.environ.get("GECKODRIVER") or shutil.which("geckodriver")
         return webdriver.Firefox(options=opts, service=Service(gecko) if gecko else Service())
     from selenium.webdriver.chrome.service import Service
@@ -44,6 +72,7 @@ def make_driver():
         opts.add_argument("--headless=new")
     opts.add_argument("--no-sandbox")
     opts.add_argument("--disable-dev-shm-usage")
+    opts.add_argument("--mute-audio")
     opts.add_argument("--window-size=1280,900")
     if os.environ.get("CHROME_BIN"):
         opts.binary_location = os.environ["CHROME_BIN"]
@@ -55,7 +84,6 @@ driver = make_driver()
 wait = WebDriverWait(driver, 20)
 lang_name = ""
 lang_code = ""
-wrong_answers = set()
 
 
 def q(css):
@@ -70,22 +98,52 @@ def data_test(name):
     return f'[data-test="{name}"]'
 
 
+def js_click(el):
+    driver.execute_script("arguments[0].click();", el)
+
+
+def usable(els):
+    out = []
+    for e in els:
+        try:
+            if e.is_displayed() and e.get_attribute("aria-disabled") != "true" \
+                    and e.get_attribute("disabled") is None:
+                out.append(e)
+        except StaleElementReferenceException:
+            pass
+    return out
+
+
+def text_of(el):
+    try:
+        return (el.get_attribute("innerText") or "").strip()
+    except StaleElementReferenceException:
+        return ""
+
+
+def safe_translate(src, tgt, text):
+    if not text.strip():
+        return ""
+    try:
+        return GoogleTranslator(source=src, target=tgt).translate(text) or ""
+    except Exception as e:
+        print("Translate failed:", type(e).__name__)
+        return ""
+
+
 def to_lang(text):
-    return GoogleTranslator(source="en", target=lang_code).translate(text)
+    return safe_translate("en", lang_code, text)
 
 
 def to_english(text):
-    return GoogleTranslator(source="auto", target="en").translate(text)
+    return safe_translate("auto", "en", text)
 
 
-def click_next():
-    q(data_test("player-next")).click()
-
+# ---------- login / start ----------
 
 def welcome():
     global lang_name, lang_code
     print("Welcome to DuoLenium")
-    # Non-interactive mode (GitHub Actions etc.): DUO_EMAIL, DUO_PASSWORD, DUO_LANG
     email = os.environ.get("DUO_EMAIL") or input("Duolingo email: ")
     password = os.environ.get("DUO_PASSWORD") or getpass("Duolingo password (hidden): ")
     lang_name = os.environ.get("DUO_LANG", "").strip().lower()
@@ -98,7 +156,6 @@ def welcome():
 def login(email, password):
     print("Logging in...")
     driver.get("https://www.duolingo.com/?isLoggingIn=true")
-    # If the login form isn't shown directly, click the "I already have an account" link.
     try:
         wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, data_test("have-account")))).click()
     except TimeoutException:
@@ -107,136 +164,237 @@ def login(email, password):
     q(data_test("email-input")).send_keys(email)
     q(data_test("password-input")).send_keys(password)
     q(data_test("register-button")).click()
-    # Wait until we've left the login page. If a CAPTCHA appears, solve it by hand.
     try:
-        wait.until(EC.url_contains("/learn"))
+        WebDriverWait(driver, 90).until(EC.url_contains("/learn"))
     except TimeoutException:
+        print("URL:", driver.current_url)
+        try:
+            print("Page text:", driver.find_element(By.TAG_NAME, "body").text[:400].replace("\n", " | "))
+        except Exception:
+            pass
+        driver.save_screenshot("login_debug.png")
         if not INTERACTIVE:
             raise SystemExit("Login didn't finish (CAPTCHA or bad credentials?).")
-        input("Login didn't finish automatically. Solve any CAPTCHA/popup in the browser, then press Enter...")
+        input("Login didn't finish. Solve any CAPTCHA in the browser, then press Enter...")
+
+
+def click_by_text(word):
+    xp = ("//*[self::button or self::a][contains(translate(normalize-space(.),"
+          "'abcdefghijklmnopqrstuvwxyz','ABCDEFGHIJKLMNOPQRSTUVWXYZ'),'%s')]" % word)
+    for el in driver.find_elements(By.XPATH, xp):
+        if el.is_displayed():
+            js_click(el)
+            return True
+    return False
 
 
 def start_practice():
-    wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, data_test("global-practice")))).click()
-
-
-# ---------- question handlers ----------
-
-def hint_sentence():
-    return " ".join(h.get_attribute("innerText") for h in qs(data_test("hint-token")))
-
-
-def check_and_continue():
-    click_next()          # "Check"
-    time.sleep(0.3)
-    click_next()          # "Continue"
-
-
-def write_in_english():
-    q(data_test("challenge-translate-input")).send_keys(to_english(hint_sentence()))
-    check_and_continue()
-
-
-def write_in_language():
-    q(data_test("challenge-translate-input")).send_keys(to_lang(hint_sentence()))
-    check_and_continue()
-
-
-def write_blank(english_word):
-    q(data_test("challenge-text-input")).send_keys(to_lang(english_word))
-    check_and_continue()
-
-
-def choose_missing():
-    options = qs(data_test("challenge-judge-text"))
-    fresh = [o for o in options if o.get_attribute("innerText") not in wrong_answers] or options
-    pick = random.choice(fresh)
-    text = pick.get_attribute("innerText")
-    pick.click()
-    click_next()
-    time.sleep(0.3)
-    if qs('[data-test="blame blame-incorrect"]'):
-        wrong_answers.add(text)
-    else:
-        wrong_answers.clear()
-    click_next()
-
-
-def mark_correct_meaning():
-    # The prompt element's CSS class changes often; fall back through a few options.
-    english = ""
-    for sel in (data_test("challenge-header") + " + div", data_test("hint-token"), "h1"):
-        els = qs(sel)
-        if els and els[0].text.strip():
-            english = els[0].text.strip()
+    sel = '[data-test~="skill-path-level-skill"], [data-test~="skill-path-level-practice"]'
+    for i in range(8):
+        driver.get("https://www.duolingo.com/learn")
+        try:
+            for attempt in range(3):
+                try:
+                    WebDriverWait(driver, 40).until(lambda d: d.find_elements(By.CSS_SELECTOR, sel))
+                    break
+                except TimeoutException:
+                    if attempt == 2:
+                        raise
+                    print("Path didn't load, retrying in 30s...")
+                    time.sleep(30)
+                    driver.get("https://www.duolingo.com/learn")
+        except TimeoutException:
+            print("URL:", driver.current_url)
+            driver.save_screenshot("path_debug.png")
+            raise SystemExit("Lesson path never appeared.")
+        time.sleep(1)
+        for el in qs(data_test("notification-drawer-no-thanks-button")):
+            try:
+                el.click()
+            except Exception:
+                pass
+        nodes = qs(sel)
+        print("Found", len(nodes), "lesson nodes; trying", i)
+        if i >= len(nodes):
             break
-    target = to_english(to_lang(english)).lower()
-    for choice in qs(data_test("challenge-judge-text")):
-        text = choice.get_attribute("innerText")
-        if to_english(text).lower() == target:
-            choice.click()
-            check_and_continue()
+        driver.execute_script("arguments[0].scrollIntoView({block:'center'});", nodes[i])
+        js_click(nodes[i])
+        time.sleep(2)
+        if "/lesson" not in driver.current_url:
+            click_by_text("START") or click_by_text("PRACTICE")
+            time.sleep(2)
+        if "/lesson" in driver.current_url and "/test" not in driver.current_url:
+            print("Started lesson:", driver.current_url)
             return
-    # No match found: guess.
-    choose_missing()
+        print("Skipped node", i, driver.current_url)
+    raise SystemExit("Couldn't start a normal lesson from the path.")
+
+
+# ---------- answering ----------
+
+def prompt_text():
+    sep = "" if lang_code in ("ja", "ko") else " "
+    for sel in (data_test("hint-token"), data_test("challenge-translate-prompt")):
+        txt = sep.join(text_of(e) for e in qs(sel) if text_of(e)).strip()
+        if txt:
+            return txt
+    # fallback: text next to the header
+    try:
+        hdr = q(data_test("challenge-header"))
+        txt = driver.execute_script(
+            "var p=arguments[0].parentElement.parentElement;return p?p.innerText:'';", hdr)
+        txt = txt.replace(hdr.text, "").strip().split("\n")[0]
+        return txt[:80]
+    except Exception:
+        return ""
+
+
+def advance():
+    for _ in range(2):
+        time.sleep(0.6)
+        try:
+            js_click(q(data_test("player-next")))
+        except NoSuchElementException:
+            pass
 
 
 def skip_question():
-    q(data_test("player-skip")).click()
-    time.sleep(0.3)
-    click_next()
+    try:
+        js_click(q(data_test("player-skip")))
+    except NoSuchElementException:
+        pass
+    advance()
+
+
+def solve_wordbank(target):
+    toks = usable(qs(TOKEN))
+    texts = [text_of(t).lower().strip(".,!?。、！？ ") for t in toks]
+    t = target.lower()
+    used, pos, clicked = set(), 0, 0
+    for _ in range(len(toks)):
+        best = None
+        for idx, txt in enumerate(texts):
+            if idx in used or not txt:
+                continue
+            i = t.find(txt, pos)
+            if i != -1 and (best is None or i < best[0]):
+                best = (i, idx)
+        if not best:
+            break
+        used.add(best[1])
+        try:
+            js_click(toks[best[1]])
+            clicked += 1
+            pos = best[0] + len(texts[best[1]])
+            time.sleep(0.2)
+        except StaleElementReferenceException:
+            pass
+    if clicked == 0:  # couldn't work out the answer: just fill the bank so Check unlocks
+        for tok in toks[:4]:
+            try:
+                js_click(tok)
+                time.sleep(0.2)
+            except StaleElementReferenceException:
+                pass
+
+
+def solve_pairs():
+    for _ in range(40):
+        toks = usable(qs(TOKEN))
+        if len(toks) < 2:
+            return
+        first = toks[0]
+        for other in toks[1:]:
+            try:
+                js_click(first)
+                js_click(other)
+            except StaleElementReferenceException:
+                break
+            time.sleep(0.4)
+            if len(usable(qs(TOKEN))) < len(toks):
+                break
+        else:
+            return  # nothing matched; give up
+
+
+def solve_choice(header, prompt):
+    choices = usable(qs(CHOICE))
+    m = re.search(r'[“"](.+?)[”"]', header)
+    target = (m.group(1) if m else to_english(prompt)).lower().strip()
+    pick = None
+    if target:
+        for c in choices:
+            txt = text_of(c).lower()
+            if not txt:
+                continue
+            tr = to_english(txt).lower()
+            if target == txt or target == tr or (len(target) > 2 and (target in tr or tr in target)):
+                pick = c
+                break
+    js_click(pick or random.choice(choices))
+
+
+def solve(header, prompt):
+    to_english_dir = "english" in header
+    target = to_english(prompt) if to_english_dir else to_lang(prompt)
+    inputs = qs(INPUT)
+    if inputs:
+        inputs[0].send_keys(target or "a")
+    elif usable(qs(TOKEN)):
+        if "matching" in header or "pair" in header:
+            solve_pairs()
+        else:
+            solve_wordbank(target)
+    elif usable(qs(CHOICE)):
+        solve_choice(header, prompt)
+    else:
+        raise RuntimeError("unknown question layout")
+    advance()
 
 
 def dismiss_popups():
-    for name in ("no-thanks-to-plus", "plus-no-thanks"):
+    for name in ("no-thanks-to-plus", "plus-no-thanks", "notification-drawer-no-thanks-button"):
         for el in qs(data_test(name)):
             try:
-                el.click()
+                js_click(el)
             except Exception:
                 pass
 
 
 def training():
-    wait.until(EC.visibility_of_element_located((By.CSS_SELECTOR, data_test("challenge-header"))))
+    time.sleep(4)
+    idle = 0
+    seen = {}
     while True:
-        time.sleep(1)
+        time.sleep(0.8)
         dismiss_popups()
-
-        if qs(data_test("player-end-carousel")) or "/lesson" not in driver.current_url and "/practice" not in driver.current_url:
-            try:
-                click_next()
-            except NoSuchElementException:
-                pass
-            print("Reached the end of the session.")
+        if "/lesson" not in driver.current_url:
+            print("Lesson finished.")
             return
-
-        try:
-            header = q(data_test("challenge-header") + " span").text.lower()
-        except NoSuchElementException:
-            # Motivational/interstitial screen
+        hdrs = qs(data_test("challenge-header") + " span")
+        if not hdrs:
+            idle += 1
+            if idle > 15:
+                print("Nothing left to do.")
+                return
             try:
-                click_next()
+                js_click(q(data_test("player-next")))
             except NoSuchElementException:
                 pass
             continue
-
-        print("Question:", header)
+        idle = 0
+        header = hdrs[0].text.lower()
+        prompt = prompt_text()
+        key = header + prompt
+        seen[key] = seen.get(key, 0) + 1
+        print("Question:", header, "|", prompt[:30])
         try:
-            if header == "write this in english":
-                write_in_english()
-            elif header == f"write this in {lang_name}":
-                write_in_language()
-            elif header.startswith("write “") or header.startswith('write "'):
-                word = header.split("“")[1].split("”")[0] if "“" in header else header.split('"')[1]
-                write_blank(word)
-            elif header in ("select the missing word", "fill in the blank"):
-                choose_missing()
-            elif header == "mark the correct meaning":
-                mark_correct_meaning()
-            else:
+            if seen[key] > 3:
                 skip_question()
+            else:
+                solve(header, prompt)
         except Exception as e:
-            print("Handler failed, skipping question:", type(e).__name__, e)
+            print("Handler failed, skipping:", type(e).__name__, str(e)[:80])
             try:
                 skip_question()
             except Exception:
@@ -246,8 +404,8 @@ def training():
 if __name__ == "__main__":
     email, password = welcome()
     login(email, password)
-    start_practice()
     try:
+        start_practice()
         training()
     finally:
         if INTERACTIVE and os.environ.get("DUO_HEADLESS") != "1":
